@@ -10,6 +10,7 @@ import pytest
 
 import omlx.patches.qwen35_ane_prefill as ane_patch
 from omlx.custom_kernels.qwen35_prefill import fast
+from omlx.patches import qwen35_packed_linear
 
 
 def test_ane_compile_bindings_release_the_python_gil():
@@ -186,6 +187,39 @@ class _Q6GDN(nn.Module):
 def test_q6_mlp_and_gdn_are_eligible_for_ane_hybrid_prefill():
     assert ane_patch._eligible_pair(_Q6MLP())
     assert ane_patch._eligible_gdn(_Q6GDN())
+
+
+def _q4_bf16(input_dims, output_dims):
+    linear = nn.QuantizedLinear(
+        input_dims, output_dims, bias=False, group_size=64, bits=4
+    )
+    linear.scales = linear.scales.astype(mx.bfloat16)
+    linear.biases = linear.biases.astype(mx.bfloat16)
+    return linear
+
+
+def test_packed_projections_are_ineligible_instead_of_raising():
+    # Packing leaves GDN b/a (narrower than a tile) stock beside packed qkv/z.
+    gdn = SimpleNamespace(
+        in_proj_qkv=_q4_bf16(256, 256),
+        in_proj_z=_q4_bf16(256, 128),
+        in_proj_b=_q4_bf16(256, 48),
+        in_proj_a=_q4_bf16(256, 48),
+    )
+    mlp = SimpleNamespace(
+        gate_proj=_q4_bf16(256, 256),
+        up_proj=_q4_bf16(256, 256),
+        down_proj=_q4_bf16(256, 256),
+    )
+    assert ane_patch._eligible_gdn(gdn)
+    assert ane_patch._eligible_pair(mlp)
+
+    qwen35_packed_linear._pack_layer(SimpleNamespace(linear_attn=gdn, mlp=mlp))
+
+    assert isinstance(gdn.in_proj_qkv, qwen35_packed_linear.PackedLinear)
+    assert type(gdn.in_proj_b) is nn.QuantizedLinear
+    assert not ane_patch._eligible_gdn(gdn)
+    assert not ane_patch._eligible_pair(mlp)
 
 
 @pytest.mark.parametrize(
@@ -767,7 +801,6 @@ def test_down_projection_cpu_share_is_prepared_and_dispatched(monkeypatch):
         linear,
         mx.zeros((1, 1, 256), dtype=mx.float16),
         8,
-        q8_threshold_env="OMLX_TEST_Q8_THRESHOLD",
         cpu_state=state,
         cpu_threads=8,
         cpu_shared_resource=True,
@@ -1035,7 +1068,6 @@ def test_compile_single_bank_targets_unpinned_instance(monkeypatch):
         calls.append((len(values), sequence_length, ane_instance))
         return [object() for _ in values]
 
-    monkeypatch.delenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", raising=False)
     monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
     monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", lambda: True)
 
@@ -1049,7 +1081,6 @@ def test_compile_single_bank_targets_unpinned_instance(monkeypatch):
 
 
 def test_enable_splits_banks_when_monolithic_load_fails(monkeypatch):
-    monkeypatch.delenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", raising=False)
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     monkeypatch.setattr(
@@ -1102,7 +1133,6 @@ def test_enable_splits_banks_when_monolithic_load_fails(monkeypatch):
 
 
 def test_enable_first_retry_is_a_near_half_split(monkeypatch):
-    monkeypatch.delenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", raising=False)
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     monkeypatch.setattr(
@@ -1136,42 +1166,7 @@ def test_enable_first_retry_is_a_near_half_split(monkeypatch):
     assert model._omlx_ane_resident_program_count == 4
 
 
-def test_enable_env_cap_forces_split_banks(monkeypatch):
-    monkeypatch.setenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", "1")
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
-    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
-    monkeypatch.setattr(
-        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
-    )
-    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
-    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
-    monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", lambda: True)
-    monkeypatch.setattr(ane_patch.time, "sleep", lambda *_a: None)
-    compiled = []
-
-    def compile_bank(weights, sequence_length, ane_instance):
-        compiled.append((len(weights), ane_instance))
-        return [object() for _ in weights]
-
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
-    model = _Model(4)
-
-    count = ane_patch.enable_qwen35_ane_prefill(
-        model,
-        sequence_length=2048,
-        fraction=0.5,
-        max_layers=4,
-        dual_ane=True,
-    )
-
-    assert count == 4
-    assert all(size == 1 for size, _ in compiled)
-    assert len(compiled) == 8
-    assert model._omlx_ane_resident_program_count == 8
-
-
 def test_enable_falls_back_to_per_layer_when_split_banks_fail(monkeypatch):
-    monkeypatch.delenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", raising=False)
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     monkeypatch.setattr(
@@ -2485,7 +2480,6 @@ def test_enable_rejects_unsafe_fixed_shape_settings(
 
 
 def test_enable_uses_ane_on_nax_gpu_when_model_setting_enabled(monkeypatch):
-    monkeypatch.delenv("OMLX_QWEN35_ANE_PREFILL", raising=False)
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: False)
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
@@ -2496,35 +2490,6 @@ def test_enable_uses_ane_on_nax_gpu_when_model_setting_enabled(monkeypatch):
     count = ane_patch.enable_qwen35_ane_prefill(model, sequence_length=2048)
 
     assert count == 2
-
-
-def test_enable_env_forces_ane_on_nax_gpu(monkeypatch):
-    monkeypatch.setenv("OMLX_QWEN35_ANE_PREFILL", "1")
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
-    monkeypatch.setattr(fast, "has_symbol", lambda name: False)
-    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
-    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
-    monkeypatch.setattr(ane_patch, "_compile_pair", lambda mlp, config: object())
-    model = _Model(2)
-
-    count = ane_patch.enable_qwen35_ane_prefill(
-        model, sequence_length=2048, max_layers=2
-    )
-
-    assert count == 2
-
-
-def test_enable_env_kill_switch_wins(monkeypatch):
-    monkeypatch.setenv("OMLX_QWEN35_ANE_PREFILL", "0")
-    installed = []
-    monkeypatch.setattr(
-        ane_patch, "_install_dispatch", lambda: installed.append(True) or True
-    )
-
-    count = ane_patch.enable_qwen35_ane_prefill(_Model(1), sequence_length=2048)
-
-    assert count == 0
-    assert installed == []
 
 
 def test_prefill_status_reports_configured_layers():
@@ -2600,7 +2565,6 @@ def test_enable_warns_when_no_eligible_layers(monkeypatch, caplog):
     monkeypatch.setattr(
         ane_patch, "_enable_dual_procedure_banks", lambda *args, **kwargs: None
     )
-    monkeypatch.delenv("OMLX_QWEN35_ANE_PREFILL", raising=False)
 
     model = SimpleNamespace(modules=lambda: [])
     with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):

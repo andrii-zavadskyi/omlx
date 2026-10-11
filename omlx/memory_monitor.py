@@ -43,6 +43,54 @@ except ImportError:
 # different head dimensions; unsupported cases fall back to an unfused
 # score-matrix allocation.
 _SDPA_VECTOR_QUERY_TOKEN_THRESHOLD = 8
+
+# Narrower Qwen4 windows (Lightning MTP) stay on masked SDPA (M5 crossover).
+_QWEN4_GATHERED_MIN_QUERY_TOKENS = 16
+
+
+def qwen4_gathered_prefill_route(
+    query_tokens: int, cache_tokens: int, indexer_budget: int
+) -> bool:
+    """Whether Qwen4 text prefill uses sparse gathered QSA."""
+    return (
+        query_tokens >= _QWEN4_GATHERED_MIN_QUERY_TOKENS
+        and cache_tokens + query_tokens > indexer_budget
+    )
+
+
+_TEXT_MROPE_EQUAL_PLANES: list[tuple[Any, int, bool]] = []
+
+
+def qwen4_text_mrope_broadcast(position_ids: Any, length: int) -> bool:
+    """True for missing/2-D text ids, or 3-D mRoPE that is a text broadcast.
+
+    The parent LanguageModel tiles identical ``(1, L)`` positions to
+    ``(3, 1, L)`` for text-only mRoPE. Real image grids differ across the
+    three planes and must stay on the official mask+SDPA path. Shared by the
+    Qwen4 runtime eligibility gate and the scheduler's route pricing so both
+    sides decide identically for image-region chunks.
+    """
+    if position_ids is None:
+        return True
+    if mx is None or not isinstance(position_ids, mx.array):
+        return False
+    if position_ids.ndim == 2:
+        return tuple(position_ids.shape) == (1, length)
+    if position_ids.ndim != 3 or tuple(position_ids.shape) != (3, 1, length):
+        return False
+    for cached_ids, cached_len, cached_same in _TEXT_MROPE_EQUAL_PLANES:
+        if cached_ids is position_ids and cached_len == length:
+            return cached_same
+    same = bool(
+        mx.array_equal(position_ids[0], position_ids[1]).item()
+        and mx.array_equal(position_ids[1], position_ids[2]).item()
+    )
+    _TEXT_MROPE_EQUAL_PLANES.append((position_ids, length, same))
+    if len(_TEXT_MROPE_EQUAL_PLANES) > 8:
+        del _TEXT_MROPE_EQUAL_PLANES[:-8]
+    return same
+
+
 _SDPA_FULL_SUPPORTED_HEAD_DIMS = frozenset({64, 72, 80, 96, 128})
 _SDPA_VECTOR_SUPPORTED_HEAD_DIMS = frozenset({64, 96, 128, 256})
 # Default bytes/elem for the materialized unfused score matrix when the model's
@@ -232,6 +280,7 @@ class MemoryMonitor:
         self._head_dim: Optional[int] = None
         # KV storage width; may be fractional with TurboQuant.
         self._dtype_size: float = 2
+        self._prefill_dtype_size: float = 2
         self._kv_bytes_per_token_override: float | None = None
         # SDPA score-matrix width = model compute/activation dtype, distinct from
         # _dtype_size (which the scheduler may override to a fractional TurboQuant
@@ -445,6 +494,7 @@ class MemoryMonitor:
         rotating_layer_specs: Sequence[tuple[int, int]] | None = None,
         prefill_memory_profile: PrefillMemoryProfile | None = None,
         ane_prefill_transient_bytes: int = 0,
+        prefill_dtype_size: Optional[float] = None,
     ) -> None:
         """
         Set model information for memory estimation.
@@ -476,11 +526,20 @@ class MemoryMonitor:
             prefill_memory_profile: Optional model-specific strategy for cache
                 and prefill transient shapes that the uniform estimator cannot
                 represent.
+            prefill_dtype_size: Bytes per KV element while a prompt prefills.
+                Defaults to ``dtype_size``. A cache that is quantized after
+                prefill holds the full-width KV, and briefly both copies,
+                before it shrinks to ``dtype_size``.
         """
         self._num_layers = num_layers
         self._num_kv_heads = num_kv_heads
         self._head_dim = head_dim
         self._dtype_size = dtype_size
+        self._prefill_dtype_size = (
+            prefill_dtype_size
+            if prefill_dtype_size is not None and prefill_dtype_size > 0
+            else dtype_size
+        )
         self._score_dtype_size = (
             compute_dtype_size
             if compute_dtype_size and compute_dtype_size > 0
@@ -656,7 +715,7 @@ class MemoryMonitor:
             layers = self._num_layers or 0
         kv_heads = self._num_kv_heads or 0
         dim = self._head_dim or 0
-        dtype = self._dtype_size
+        dtype = self._prefill_dtype_size
 
         if not (layers and kv_heads and dim):
             return 0
@@ -860,6 +919,16 @@ class MemoryMonitor:
                 _GLM5NextPrefillMemoryProfile,
                 _DeepSeekV41PrefillMemoryProfile,
             ),
+        )
+
+    def qwen4_gathered_prefill_route(
+        self, query_tokens: int, cache_tokens: int
+    ) -> bool:
+        profile = self._prefill_memory_profile
+        return isinstance(
+            profile, _Qwen4ExpPrefillMemoryProfile
+        ) and qwen4_gathered_prefill_route(
+            query_tokens, cache_tokens, profile.indexer_budget
         )
 
     def estimate_chunk_transient_bytes(
@@ -1952,10 +2021,16 @@ def estimate_qwen4_exp_kv_bytes_per_token(
     return float(qsa_layers * per_layer)
 
 
+# Per-layer caches that hold recurrent state instead of attention KV.
+_STATE_ONLY_CACHE_TYPES = frozenset({"ArraysCache", "MambaCache", "SizedArraysCache"})
+
+
 def estimate_mla_kv_bytes_per_token(
     config: Any,
     cache_list: Any,
     dtype_size: float,
+    *,
+    latent_kv_cache: bool = False,
 ) -> float | None:
     """Estimate exact resident KV bytes/token for MLA-style caches.
 
@@ -1966,6 +2041,10 @@ def estimate_mla_kv_bytes_per_token(
     ``index_head_dim`` key per token, while GLM-5.3 pools those keys by the
     cache's compression ratio. Falling back to the standard uniform KV formula
     over-counts these models by more than an order of magnitude.
+
+    ``latent_kv_cache`` marks absorbed MLA (DeepSeek-V3, Kimi, GLM-4.7-Flash,
+    ...), which stores the latent and RoPE key in a plain KVCache per layer.
+    Expanded MLA (DeepSeek-V2, MiniCPM3) stores full K/V there instead.
     """
     kv_lora_rank = _cfg_get(config, "kv_lora_rank")
     rope_dim = _cfg_get(config, "qk_rope_head_dim")
@@ -1981,6 +2060,11 @@ def estimate_mla_kv_bytes_per_token(
         for layer_cache in cache_list:
             caches = getattr(layer_cache, "caches", None)
             if caches is None:
+                if (
+                    latent_kv_cache
+                    and type(layer_cache).__name__ not in _STATE_ONLY_CACHE_TYPES
+                ):
+                    main_cache_layers += 1
                 continue
             n_caches = len(caches)
             if n_caches >= 1:

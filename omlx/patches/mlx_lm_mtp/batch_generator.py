@@ -13,10 +13,12 @@ Auto depth and parking use the measured cost of the whole active batch.
 from __future__ import annotations
 
 import contextlib
+import functools
 import inspect
 import logging
 import math
 import time
+import weakref
 from collections import deque
 from dataclasses import dataclass, field
 from statistics import median
@@ -26,23 +28,43 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 from omlx.prefill_progress import get_prefill_tracker
 
 from . import cache_rollback as _rollback_mod
+from . import context_copy as _context_copy
 from . import prompt_priming as _prompt_priming
 
 logger = logging.getLogger(__name__)
 
 
-def _set_verify_qmm_armed(flag: bool) -> None:
+def _set_verify_qmm_armed(flag: bool, *, row_exact: bool = False) -> None:
     """Arm the verify-shape qmm routing for the duration of an MTP forward.
 
-    Import is deferred and failure-tolerant: the kernel module is optional
-    and its absence must not affect the MTP path.
+    ``row_exact`` arms the row-exact mode instead (see
+    ``_row_exact_verify``). Import is deferred and failure-tolerant: the
+    kernel module is optional and its absence must not affect the MTP path.
     """
     try:
         from ..qwen35_verify_qmm import set_verify_qmm_armed
 
-        set_verify_qmm_armed(flag)
+        set_verify_qmm_armed(flag, row_exact=row_exact)
     except Exception:
         pass
+
+
+def _row_exact_verify(model: Any) -> bool:
+    """Whether the target's verify rows must reproduce its one-row decode.
+
+    Models opt in with ``_omlx_mtp_row_exact_verify`` (Qwen4-Exp). Their
+    armed verify forwards then run every multi-row quantized projection,
+    DeltaNet prework and attention row with the arithmetic of a serial
+    decode step, so greedy MTP output equals MTP-off output byte for byte.
+    """
+    for candidate in (
+        model,
+        getattr(model, "_language_model", None),
+        getattr(model, "language_model", None),
+    ):
+        if getattr(candidate, "_omlx_mtp_row_exact_verify", False):
+            return True
+    return False
 
 
 def _set_dspark_target_verify(model: Any, flag: bool) -> None:
@@ -101,6 +123,7 @@ def apply() -> bool:
         def patched_next(self, *args, **kwargs):
             if _is_mtp_batch_eligible(self):
                 policy = _batch_policy_for_next(self)
+                _batch_park_memory(self.model).tick()
                 if policy is not None and policy.needs_standard():
                     if not _reconcile_mtp_batch_to_standard(self):
                         raise RuntimeError(
@@ -199,15 +222,19 @@ def apply() -> bool:
 
             host_state = getattr(self, "_omlx_mtp_state", None)
             if host_state is not None and _mtp_state_valid_for_batch(self, host_state):
-                if host_state.reentry_probe:
-                    park_state = _mtp_park_state_for_batch(self)
-                    if park_state is not None:
-                        park_state.defer_probe()
-                if not _reconcile_mtp_to_standard(self, host_state):
-                    raise RuntimeError(
-                        "Lightning MTP could not restore the committed cache"
-                    )
-                _drop_mtp_state(self, "extend-reconciled")
+                # A shared batch that a finishing row just filtered to this
+                # singleton sits at a drained frontier: hand it off with at
+                # most a one-token forward instead of replaying its history.
+                if not _handoff_mtp_for_late_join(self, host_state):
+                    if host_state.reentry_probe:
+                        park_state = _mtp_park_state_for_batch(self)
+                        if park_state is not None:
+                            park_state.defer_probe()
+                    if not _reconcile_mtp_to_standard(self, host_state):
+                        raise RuntimeError(
+                            "Lightning MTP could not restore the committed cache"
+                        )
+                    _drop_mtp_state(self, "extend-reconciled")
             result = original_extend(self, batch, *args, **kwargs)
             _drop_mtp_state(batch, "donor-extended")
             _drop_invalid_mtp_state(self, "extend")
@@ -344,17 +371,32 @@ def _model_has_mtp_module(model: Any) -> bool:
 _SPEC_BUFFER_CAPS = (200, 512)
 
 
+@functools.lru_cache(maxsize=1)
+def _raises_spec_buffer_caps() -> bool:
+    """True on GPUs where the raised caps were measured: M5 and the M3 family."""
+    import mlx.core as mx
+
+    from omlx.custom_kernels.nax import is_nax_available
+
+    if is_nax_available():
+        return True
+    try:
+        architecture = str(mx.device_info().get("architecture", ""))
+    except Exception:
+        return False
+    return architecture.startswith("applegpu_g15")
+
+
 @contextlib.contextmanager
 def _spec_command_buffers():
     """Raise MLX's command-buffer caps for one speculative decode step.
 
-    Measured on M5 only, so other GPUs keep MLX's caps.
+    Measured on M5 and M3 Ultra, so other GPUs keep MLX's caps.
     """
-    from omlx.custom_kernels.nax import is_nax_available
     from omlx.custom_kernels.qwen35_prefill.fast import set_command_buffer_caps
 
     previous = None
-    if is_nax_available():
+    if _raises_spec_buffer_caps():
         previous = set_command_buffer_caps(*_SPEC_BUFFER_CAPS)
     try:
         yield
@@ -721,6 +763,11 @@ class _MtpStats:
     depth_accepted: List[int] = field(default_factory=list)
     # Cycles the depth controller parked at 0 (plain steps, no speculation).
     zero_cycles: int = 0
+    # Cycles whose drafts were copied from the context instead of the head,
+    # and their drafted / accepted token counts (kept out of depth[...]).
+    copy_cycles: int = 0
+    copy_drafted: int = 0
+    copy_accepted: int = 0
     # Component-level timings. Help diagnose where MTP overhead comes from
     # when accept rate is healthy but wall-clock throughput isn't.
     backbone_ms: float = 0.0  # cumulative time inside the 2-token verify forward
@@ -805,6 +852,14 @@ class _MtpState:
     # Boundary tokens need a one-row forward on a private cache.
     boundary_emit_pending: bool = False
 
+    # Context-copy proposer (greedy chain cycles), whether the pending drafts
+    # came from it rather than the MTP head, and whether this cycle rebuilt
+    # its index (a one-off host cost the depth controller must not time as
+    # the window's).
+    context_copy: Optional[Any] = None
+    copy_drafts: bool = False
+    copy_untimed: bool = False
+
     # Accept-rate / throughput counters. Surfaced via logger.info on finish.
     stats: _MtpStats = field(default_factory=_MtpStats)
 
@@ -828,10 +883,11 @@ _MTP_REENTRY_MAX_COOLDOWN_TOKENS = 4096
 class _MtpParkState:
     """Per-sequence policy state for reversible performance parking.
 
-    The MTP cache itself is dropped so the standard decoder regains its
-    pipelined fast path. This host-side record survives the handoff and admits
-    a later MTP probe. It is keyed by uid because GenerationBatch objects are
-    reused across requests.
+    The MTP state is dropped so the standard decoder regains its pipelined
+    fast path; prompt priming keeps the committed head history and records the
+    parked tokens for the probe. This host-side record survives the handoff
+    and admits a later MTP probe. It is keyed by uid because GenerationBatch
+    objects are reused across requests.
     """
 
     uid: Any
@@ -1293,11 +1349,28 @@ def _prepare_mtp_batch_state_for_next(gen_batch: Any) -> Optional[_MtpBatchState
     return batch_state
 
 
+# One ParkMemory per live model object (keyed by id: models are dict-like
+# modules; the weak reference keeps a reused id from inheriting verdicts).
+_BATCH_PARK_MEMORY: Dict[int, Tuple[Any, Any]] = {}
+
+
+def _batch_park_memory(model: Any):
+    from .batch_policy import ParkMemory
+
+    entry = _BATCH_PARK_MEMORY.get(id(model))
+    if entry is None or entry[0]() is not model:
+        entry = _BATCH_PARK_MEMORY[id(model)] = (weakref.ref(model), ParkMemory())
+    return entry[1]
+
+
 def _batch_policy_for_next(gen_batch: Any):
     from .batch_policy import BatchPolicy
 
     policy = getattr(gen_batch, "_omlx_mtp_batch_policy", None)
     if policy is None or policy.uids != tuple(gen_batch.uids):
+        memory = _batch_park_memory(gen_batch.model)
+        if policy is not None:
+            memory.retired(policy)
         chain, depth, _ = _resolve_mtp_chain_depth(gen_batch.model)
         policy = BatchPolicy(
             gen_batch.uids,
@@ -1305,6 +1378,7 @@ def _batch_policy_for_next(gen_batch: Any):
             fixed=_drafter_for(gen_batch.model) is not None
             or _mtp_depth_fixed(gen_batch.model),
         )
+        memory.seed(policy)
         gen_batch._omlx_mtp_batch_policy = policy
     return policy
 
@@ -1553,6 +1627,19 @@ def _logprobs(logits_2d):
     return logits_2d - mx.logsumexp(logits_2d, axis=-1, keepdims=True)
 
 
+# Serial greedy decoding (mlx-lm ``GenerationBatch._step``) samples
+# ``logits - logsumexp(logits)`` in the logits dtype, so its argmax runs over
+# rounded log-probabilities: once a logit is below half the logsumexp the
+# bf16 subtraction is inexact, two adjacent logits can land on one
+# log-probability, and the tie goes to the lower token id. Verify rows take
+# the same argmax so greedy MTP output equals MTP-off output.
+def _greedy_targets(logprobs):
+    """Greedy tokens of verify rows, as the serial greedy sampler picks them."""
+    import mlx.core as mx
+
+    return mx.argmax(logprobs, axis=-1).astype(mx.int32)
+
+
 def _accept_lp_for(sampler, lp):
     """Reproduce the sampler's filter+temperature pipeline on `lp` so the
     acceptance ratio (and residual distribution) match the distribution the
@@ -1603,6 +1690,298 @@ def _sample_draft_with_logprobs(sampler, lp):
     if shared is not None:
         return shared(lp)
     return sampler(lp), _accept_lp_for(sampler, lp)
+
+
+def _sample_draft_sparse(sampler, lp, top_k: int):
+    """``sample_with_logprobs`` on the ``top_k`` support only.
+
+    Returns the token, the candidate ids and their draft log-densities. The
+    filters match ``apply_top_p_top_k`` on full-vocab log-probabilities, so
+    the distribution equals the dense one restricted to its support.
+    """
+    import mlx.core as mx
+
+    from omlx.utils.sampling import top_k_indices
+
+    top_p = float(getattr(sampler, "top_p", 0.0) or 0.0)
+    temp = float(sampler.temp)
+    ids = top_k_indices(lp, top_k)
+    vals = mx.take_along_axis(lp, ids, axis=-1).astype(mx.float32)
+    order = mx.argsort(-vals, axis=-1)
+    vals = mx.take_along_axis(vals, order, axis=-1)
+    ids = mx.take_along_axis(ids, order, axis=-1)
+    if 0.0 < top_p < 1.0:
+        probs = mx.exp(vals)
+        vals = mx.where(mx.cumsum(probs, axis=-1) - probs < top_p, vals, -float("inf"))
+    scaled = vals * (1.0 / temp)
+    pick = mx.random.categorical(scaled)
+    token = mx.take_along_axis(ids, pick[:, None], axis=-1).reshape(-1)
+    logq = scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)
+    return token, ids.reshape(-1).astype(mx.int32), logq
+
+
+# Draft chains score each step's whole vocabulary with a 3-bit copy of the
+# lm_head and rescore only its best candidates with the real weights. On
+# code, the coarse top-64 holds 99.8% of the exact top-20 (Flash-Next: 91% at
+# 2 bits), and a step reads about 30-60% fewer bytes.
+_COARSE_HEAD_BITS = 3
+_COARSE_HEAD_GROUP = 128
+_COARSE_CANDIDATES = 64
+_COARSE_MIN_VOCAB = 65536
+_COARSE_HEADS: Dict[int, Any] = {}
+
+
+class _CoarseDraftHead:
+    """MTP chain head that rescores a few coarse candidates per step."""
+
+    def __init__(self, lang, mtp, coarse):
+        self.lang = lang
+        self.mtp = mtp
+        self.coarse = coarse
+
+    def hidden(self, hidden_states, tokens, cache):
+        """The head's ``(logits source, chain hidden)``.
+
+        Qwen4 heads return both; its mixer folds the hyper streams for the logits.
+        """
+        out = self.mtp(hidden_states, tokens, self.lang.model.embed_tokens, cache)
+        return out if isinstance(out, tuple) else (out, out)
+
+    def candidates(self, h):
+        """Vocab ids ``(1, M)`` and their log-probabilities for hidden ``h``.
+
+        The candidates normalize among themselves: the coarse logits are too
+        narrow to estimate the vocabulary's normalizer.
+        """
+        import mlx.core as mx
+
+        from omlx.utils.sampling import top_k_indices
+
+        head = self.lang.lm_head
+        approx = self.coarse(h[:, -1, :]).astype(mx.float32)
+        ids = top_k_indices(approx, _COARSE_CANDIDATES)
+        exact = mx.quantized_matmul(
+            h[:, -1, :],
+            *_head_rows(head, ids.reshape(-1)),
+            transpose=True,
+            group_size=head.group_size,
+            bits=head.bits,
+        )
+        exact = exact.astype(mx.float32)
+        return ids, exact - mx.logsumexp(exact, axis=-1, keepdims=True)
+
+
+def _head_rows(head, rows):
+    """Weight, scales and biases of lm_head rows, also from M5's packed layout."""
+    gather = getattr(head, "quantized_rows", None)
+    if gather is not None:
+        return gather(rows)
+    return head.weight[rows], head.scales[rows], head.biases[rows]
+
+
+def _head_vocab(head) -> int:
+    return int(getattr(head, "output_dims", 0) or head.weight.shape[0])
+
+
+def _mtp_language_model(model):
+    for name in ("_language_model", "language_model"):
+        inner = getattr(model, name, None)
+        if inner is not None:
+            return inner
+    return model
+
+
+def _mtp_module(lang):
+    get = getattr(lang, "get_mtp_module", None)
+    return get() if callable(get) else getattr(lang, "mtp", None)
+
+
+def _drafts_before_commit(model) -> bool:
+    forward = getattr(type(_mtp_language_model(model)), "mtp_forward", None)
+    return bool(getattr(forward, "_omlx_head_cache_only", False))
+
+
+def _chain_tail_caches(model, mtp_cache):
+    """Tail views of the head's KV caches, or None when the head cannot use them."""
+    from mlx_lm.models.cache import KVCache
+
+    from ..qwen35_verify_sdpa_split import ChainKVCache, install_chain_attention
+
+    if not _drafts_before_commit(model) or not mtp_cache:
+        return None
+    layers = getattr(getattr(_mtp_language_model(model), "mtp", None), "layers", [])
+    if len(layers) != len(mtp_cache) or not all(
+        type(c) is KVCache and c.keys is not None for c in mtp_cache
+    ):
+        return None
+    if not all(install_chain_attention(type(layer.self_attn)) for layer in layers):
+        return None
+    return [ChainKVCache(c) for c in mtp_cache]
+
+
+# ``_sample_draft_sparse`` over at most 64 candidate log-probabilities in one
+# simdgroup: rank by (value desc, index asc), keep top_k, cut at top_p on the
+# given probabilities, then scale by 1/temp and draw by inverse CDF.
+_CANDIDATE_SAMPLE_SOURCE = """
+    uint lane = thread_index_in_simdgroup;
+    threadgroup float sv[64];
+    threadgroup int si[64];
+    float v[2];
+    for (int h = 0; h < 2; ++h) {
+        int idx = int(lane) + h * 32;
+        v[h] = idx < M ? lp[idx] : -INFINITY;
+    }
+    for (int h = 0; h < 2; ++h) {
+        int idx = int(lane) + h * 32;
+        int rank = 0;
+        for (int j = 0; j < 64; ++j) {
+            float o = simd_shuffle(v[j / 32], ushort(j % 32));
+            rank += (j < M && (o > v[h] || (o == v[h] && j < idx))) ? 1 : 0;
+        }
+        if (idx < M && rank < TOPK) {
+            sv[rank] = v[h];
+            si[rank] = idx;
+        }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    bool live = int(lane) < min(TOPK, M);
+    float x = live ? sv[lane] : -INFINITY;
+    int id = live ? si[lane] : 0;
+    if (TOP_P_ON) {
+        float p = live ? exp(x) : 0.0f;
+        if (!(simd_prefix_exclusive_sum(p) < params[0]))
+            x = -INFINITY;
+    }
+    float scaled = x * params[1];
+    float m = simd_max(scaled);
+    float e = scaled == -INFINITY ? 0.0f : exp(scaled - m);
+    float total = simd_sum(e);
+    float q = scaled == -INFINITY ? -INFINITY : scaled - m - log(total);
+    float cdf = simd_prefix_inclusive_sum(e) / total;
+    int first = simd_min((e > 0.0f && cdf > params[2]) ? int(lane) : 32);
+    int last = simd_max(e > 0.0f ? int(lane) : -1);
+    int pick = first < 32 ? first : last;
+    if (int(lane) < TOPK) {
+        ids[lane] = id;
+        logq[lane] = q;
+    }
+    int chosen = simd_shuffle(id, ushort(pick));
+    if (lane == 0)
+        token[0] = chosen;
+"""
+_CANDIDATE_SAMPLE_KERNEL = None
+
+
+def _sample_candidates_fused(sampler, lp, top_k: int):
+    """``_sample_draft_sparse`` for ``(1, M)`` log-probs, M <= 64, top_k <= 32."""
+    import mlx.core as mx
+
+    global _CANDIDATE_SAMPLE_KERNEL
+    if _CANDIDATE_SAMPLE_KERNEL is None:
+        _CANDIDATE_SAMPLE_KERNEL = mx.fast.metal_kernel(
+            name="omlx_mtp_candidate_sample",
+            input_names=["lp", "params"],
+            output_names=["token", "ids", "logq"],
+            source=_CANDIDATE_SAMPLE_SOURCE,
+        )
+    top_p = float(getattr(sampler, "top_p", 0.0) or 0.0)
+    params = mx.concatenate(
+        [
+            mx.array([top_p, 1.0 / float(sampler.temp)], dtype=mx.float32),
+            mx.random.uniform(shape=(1,)),
+        ]
+    )
+    token, ids, logq = _CANDIDATE_SAMPLE_KERNEL(
+        inputs=[lp.reshape(-1).astype(mx.float32), params],
+        template=[
+            ("M", int(lp.shape[-1])),
+            ("TOPK", int(top_k)),
+            ("TOP_P_ON", int(0.0 < top_p < 1.0)),
+        ],
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(1,), (top_k,), (top_k,)],
+        output_dtypes=[mx.int32, mx.int32, mx.float32],
+    )
+    return token, ids, logq[None]
+
+
+def _quantize_mtp_fc(mtp) -> None:
+    """Store a dense MTP input projection at 4 bits.
+
+    Checkpoints keep it in bf16; at 4 bits the head's first-step acceptance
+    is unchanged on code and Korean text and each draft step reads 76 MB less.
+    """
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    fc = getattr(mtp, "fc", None)
+    if (
+        type(fc) is not nn.Linear
+        or "bias" in fc
+        or fc.weight.dtype not in (mx.bfloat16, mx.float16)
+        or fc.weight.shape[1] % 64
+    ):
+        return
+    mtp.fc = nn.QuantizedLinear.from_linear(fc, group_size=64, bits=4)
+    mx.eval(mtp.fc.parameters())
+
+
+def _coarse_draft_head(model) -> Optional[_CoarseDraftHead]:
+    """The coarse chain head for Qwen3.5/Qwen4 MTP with a quantized lm_head.
+
+    The first call per head builds the coarse copy and stores the MTP ``fc``
+    at 4 bits.
+    """
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    lang = _mtp_language_model(model)
+    head = getattr(lang, "lm_head", None)
+    mtp = _mtp_module(lang)
+    forward = getattr(type(lang), "mtp_forward", None)
+    if (
+        not getattr(forward, "_omlx_lm_head_logits", False)
+        or mtp is None
+        or getattr(getattr(lang, "args", None), "tie_word_embeddings", True)
+        or not (isinstance(head, nn.QuantizedLinear) or hasattr(head, "quantized_rows"))
+        or getattr(head, "mode", "affine") != "affine"
+        or "bias" in head
+        or _head_vocab(head) < _COARSE_MIN_VOCAB
+    ):
+        return None
+    coarse = _COARSE_HEADS.get(id(head))
+    if coarse is None:
+        _quantize_mtp_fc(mtp)
+        rows = _head_vocab(head)
+        parts = []
+        for start in range(0, rows, 16384):
+            end = min(rows, start + 16384)
+            weight = mx.dequantize(
+                *_head_rows(head, mx.arange(start, end)),
+                group_size=head.group_size,
+                bits=head.bits,
+            )
+            part = mx.quantize(
+                weight, group_size=_COARSE_HEAD_GROUP, bits=_COARSE_HEAD_BITS
+            )
+            mx.eval(part)
+            parts.append(part)
+        coarse = nn.QuantizedLinear(
+            int(weight.shape[1]),
+            rows,
+            bias=False,
+            group_size=_COARSE_HEAD_GROUP,
+            bits=_COARSE_HEAD_BITS,
+        )
+        coarse.weight, coarse.scales, coarse.biases = (
+            mx.concatenate([part[i] for part in parts], axis=0) for i in range(3)
+        )
+        mx.eval(coarse.parameters())
+        _COARSE_HEADS[id(head)] = coarse
+        # The copy lives as long as its model.
+        weakref.finalize(head, _COARSE_HEADS.pop, id(head), None)
+    return _CoarseDraftHead(lang, mtp, coarse)
 
 
 def _trim_token_buffer(gen_batch: Any, n: int) -> None:
@@ -1761,7 +2140,12 @@ def _call_backbone_impl(
     _rollback_mod.set_undo_armed(True)
     # The affine verify qmm kernel is a Qwen-specific optimization. Keep the
     # DeepSeek target on its architecture-native quantized linear path.
-    _set_verify_qmm_armed(not dspark_verify)
+    # Row-exact runs each row as a one-row matvec. Batched decode has no
+    # one-row baseline, so B > 1 verify keeps the multi-row kernels.
+    _set_verify_qmm_armed(
+        not dspark_verify,
+        row_exact=inputs.shape[0] == 1 and _row_exact_verify(model),
+    )
     _set_dspark_target_verify(model, dspark_verify)
     try:
         result = model(inputs, **kwargs)
@@ -1941,6 +2325,21 @@ def _trunk_norm_module(model: Any):
 # folds and the decode-time history folds here must use the same hidden
 # variant or the primed history would be inconsistent with the chained one.
 _HEAD_HIDDEN_POST_NORM = _prompt_priming.HEAD_HIDDEN_POST_NORM
+
+
+def _head_input(model: Any, hidden: Any) -> Any:
+    """Trunk hidden as the MTP head consumes it.
+
+    Models whose head normalizes its input internally (inkling's per-block
+    hidden_norm, Qwen4's raw hyper streams) mark themselves and receive the
+    raw pre-norm trunk hidden.
+    """
+    head_prenorm = getattr(model, "_omlx_mtp_head_prenorm", False) or getattr(
+        getattr(model, "_language_model", None), "_omlx_mtp_head_prenorm", False
+    )
+    if _HEAD_HIDDEN_POST_NORM and not head_prenorm and hidden.ndim == 3:
+        return _trunk_norm_module(model)(hidden)
+    return hidden
 
 
 def _mtp_head_trim_to(mtp_cache: List[Any], offset: int) -> None:
@@ -2500,6 +2899,7 @@ def _dspark_next_drafts(
     hidden_rows: Any,
     committed: Any,
     prev_buf: Optional[Any],
+    depth: Optional[int] = None,
 ) -> None:
     """Append committed target taps and sample one DSpark block.
 
@@ -2513,7 +2913,8 @@ def _dspark_next_drafts(
     if host is None:
         raise _MtpStepFallback("embedded DSpark host is unavailable")
 
-    depth = state.controller.cur if state.controller is not None else state.depth
+    if depth is None:
+        depth = state.controller.cur if state.controller is not None else state.depth
     depth = min(int(depth), int(getattr(host.args, "dspark_block_size", depth)))
     n = int(committed.shape[0])
     if depth <= 0:
@@ -2576,6 +2977,7 @@ def _chain_next_drafts(
     hidden_rows: Any,
     committed: Any,
     prev_buf: Optional[Any],
+    depth: Optional[int] = None,
 ) -> None:
     """Rebuild committed MTP-head history and draft the next chain.
 
@@ -2606,11 +3008,13 @@ def _chain_next_drafts(
             hidden_rows,
             committed,
             prev_buf,
+            depth,
         )
     sampler = _resolve_draft_sampler(gen_batch, state)
     procs = _proc_list(gen_batch)
 
-    depth = state.controller.cur if state.controller is not None else state.depth
+    if depth is None:
+        depth = state.controller.cur if state.controller is not None else state.depth
     if depth == 0 and not state.mtp_cache:
         # Depth-0 with a stateless head (no cache to keep warm, e.g. the
         # gemma4 assistant): skip the fold entirely — on fast backbones its
@@ -2623,14 +3027,7 @@ def _chain_next_drafts(
         state.draft_accept_lps = []
         return
 
-    # Models whose MTP head normalizes its hidden input internally
-    # (inkling: per-block hidden_norm, chain_hidden_post_norm=False) mark
-    # themselves and receive the raw pre-norm trunk hidden.
-    head_prenorm = getattr(model, "_omlx_mtp_head_prenorm", False) or getattr(
-        getattr(model, "_language_model", None), "_omlx_mtp_head_prenorm", False
-    )
-    if _HEAD_HIDDEN_POST_NORM and not head_prenorm and hidden_rows.ndim == 3:
-        hidden_rows = _trunk_norm_module(model)(hidden_rows)
+    hidden_rows = _head_input(model, hidden_rows)
 
     # Multi-block heads (inkling) route fold/chain by a per-cycle pass
     # counter on the cache list; reset it before the fold. Single-block
@@ -2641,14 +3038,22 @@ def _chain_next_drafts(
     if begin is not None:
         begin(state.mtp_cache, depth)
 
+    sparse_k = _sparse_top_k(sampler) if procs is None else 0
+    coarse = _coarse_draft_head(model) if 0 < sparse_k <= 32 else None
     n = committed.shape[0]
-    logits, head_hidden = model.mtp_forward(
-        hidden_rows,
-        committed.reshape(1, n),
-        state.mtp_cache,
-        return_hidden=True,
-        logits_keep=1,
-    )
+    if coarse is None:
+        logits, head_hidden = model.mtp_forward(
+            hidden_rows,
+            committed.reshape(1, n),
+            state.mtp_cache,
+            return_hidden=True,
+            logits_keep=1,
+        )
+    else:
+        logits = None
+        source, head_hidden = coarse.hidden(
+            hidden_rows, committed.reshape(1, n), state.mtp_cache
+        )
     state.hist_offset += int(n)
 
     draft_toks: List[Any] = []
@@ -2660,34 +3065,51 @@ def _chain_next_drafts(
     chain_cache = state.mtp_cache
     if state.head_clone and depth > 1:
         chain_cache = _clone_mtp_head_cache(state.mtp_cache)
+    elif depth > 1:
+        chain_cache = _chain_tail_caches(model, state.mtp_cache) or chain_cache
 
     # Speculative draft shaping — see _dspark_next_drafts.
     snap = _snap_snapshotable(procs)
 
+    sparse_ids: List[Any] = []
     for j in range(depth):
-        logits_2d = logits[:, -1, :]
-        if procs is not None and prev_buf is not None:
-            prev = mx.concatenate(
-                [prev_buf.astype(mx.int32), chain_prefix.astype(mx.int32)]
-                + [t.reshape(1).astype(mx.int32) for t in draft_toks]
-            )
-            logits_2d = _apply_processors(procs, prev, logits_2d)
-        lp_2d = _logprobs(logits_2d)
-        tok, accept_lp = _sample_draft_with_logprobs(sampler, lp_2d)
+        if coarse is not None:
+            # Emitted drafts then report the target's own log-probabilities.
+            cand_ids, cand_lp = coarse.candidates(source)
+            tok, ids, accept_lp = _sample_candidates_fused(sampler, cand_lp, sparse_k)
+            tok = mx.take(cand_ids.reshape(-1), tok)
+            sparse_ids.append(mx.take(cand_ids.reshape(-1), ids))
+        else:
+            logits_2d = logits[:, -1, :]
+            if procs is not None and prev_buf is not None:
+                prev = mx.concatenate(
+                    [prev_buf.astype(mx.int32), chain_prefix.astype(mx.int32)]
+                    + [t.reshape(1).astype(mx.int32) for t in draft_toks]
+                )
+                logits_2d = _apply_processors(procs, prev, logits_2d)
+            lp_2d = _logprobs(logits_2d)
+            if sparse_k:
+                tok, ids, accept_lp = _sample_draft_sparse(sampler, lp_2d, sparse_k)
+                sparse_ids.append(ids)
+            else:
+                tok, accept_lp = _sample_draft_with_logprobs(sampler, lp_2d)
+            draft_lps.append(lp_2d.squeeze(0))
         tok = _ensure_uint32(tok)
         draft_toks.append(tok)
-        draft_lps.append(lp_2d.squeeze(0))
         draft_accept_lps.append(accept_lp.squeeze(0))
         if j + 1 == depth:
             break
         # Start this step on the GPU while the host encodes the next one.
         mx.async_eval(tok, h)
-        logits, head_hidden = model.mtp_forward(
-            h,
-            tok.reshape(1, 1),
-            chain_cache,
-            return_hidden=True,
-        )
+        if coarse is None:
+            logits, head_hidden = model.mtp_forward(
+                h,
+                tok.reshape(1, 1),
+                chain_cache,
+                return_hidden=True,
+            )
+        else:
+            source, head_hidden = coarse.hidden(h, tok.reshape(1, 1), chain_cache)
         h = head_hidden[:, -1:]
 
     _restore_snapshotable(procs, snap)
@@ -2703,7 +3125,17 @@ def _chain_next_drafts(
         # verifies [next_main] alone, i.e. a plain decode step. The fold
         # above still ran so head-history models stay warm for re-entry.
         state.drafts = mx.zeros((0,), dtype=mx.uint32)
+        # Keep the head-cache fold from piling up lazily across draftless
+        # cycles; its logits are never read, so they are never computed.
+        mx.async_eval(head_hidden)
     state.draft_lps = draft_lps
+    if sparse_ids:
+        vocab = (
+            _head_vocab(coarse.lang.lm_head) if coarse is not None else lp_2d.shape[-1]
+        )
+        draft_accept_lps = SparseDraftQ(
+            mx.stack(sparse_ids), mx.stack(draft_accept_lps), vocab
+        )
     state.draft_accept_lps = draft_accept_lps
 
 
@@ -2922,6 +3354,9 @@ def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> An
         policy = None
     saved = [(state.controller, state.depth) for state in states]
     depths = [int(state.drafts.shape[0]) if state.chain else 1 for state in states]
+    # Copied windows are not draft-depth decisions; the singleton depth
+    # controller skips them too.
+    copied = any(state.copy_drafts for state in states)
     previous = [(state.stats.cycles, state.stats.accepts) for state in states]
     requested = policy.cur if policy is not None else None
     if policy is not None:
@@ -2947,6 +3382,7 @@ def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> An
     )
     if (
         policy is not None
+        and not copied
         and tuple(gen_batch.uids) == policy.uids
         and len(set(depths)) == 1
         and depths[0] > 0
@@ -2974,6 +3410,7 @@ def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> An
                     "Lightning MTP could not restore batch parking state"
                 )
             policy.park()
+            _batch_park_memory(gen_batch.model).parked(policy)
             logger.info(
                 "Lightning MTP batch parked: rows=%d standard_ms=%.3f cooldown=%d",
                 len(states),
@@ -3119,11 +3556,14 @@ def _feed_batch_mains_to_standard(gen_batch: Any, batch_state: _MtpBatchState) -
     return True
 
 
-def _feed_next_main_to_standard(gen_batch: Any, state: _MtpState) -> bool:
+def _feed_next_main_to_standard(
+    gen_batch: Any, state: _MtpState, retain_head: bool = False
+) -> bool:
     """Materialize the committed main token and sample its successor.
 
     A failed one-token handoff retries once by rebuilding committed history.
     Only an absent main token returns False; failed recovery stops decoding.
+    ``retain_head`` hands the committed head history to prompt priming.
     """
     import mlx.core as mx
 
@@ -3137,7 +3577,7 @@ def _feed_next_main_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         if procs is not None:
             prev_buf = gen_batch._token_context[0].update_and_fetch(state.next_main)
         drafter = _drafter_for(gen_batch.model)
-        logits, _, _, captured = _call_backbone_captured(
+        logits, hidden, _, captured = _call_backbone_captured(
             gen_batch.model,
             state.next_main[:, None],
             gen_batch.prompt_cache,
@@ -3145,6 +3585,17 @@ def _feed_next_main_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         )
         if drafter is not None:
             drafter.observe(gen_batch.uids, captured)
+        if retain_head and state.chain and state.head_history_primed:
+            if not state.head_clone:
+                _mtp_head_trim_to(state.mtp_cache, state.hist_offset)
+            _prompt_priming.retain_parked_head_history(
+                gen_batch.model,
+                state.uid,
+                state.mtp_cache,
+                state.hist_offset,
+                _head_input(gen_batch.model, hidden[:, -1:]),
+                gen_batch.prompt_cache,
+            )
         last = _apply_processors(procs, prev_buf, logits[:, -1, :])
         lp_2d = _logprobs(last)
         next_tok = _ensure_uint32(_resolve_sampler(gen_batch)(lp_2d))
@@ -3173,7 +3624,7 @@ def _park_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
     without the MTP loop tax. A later singleton probe creates a fresh depth
     controller; repeated failed probes exponentially extend the cooldown.
     """
-    if not _feed_next_main_to_standard(gen_batch, state):
+    if not _feed_next_main_to_standard(gen_batch, state, retain_head=True):
         return False
     park_state = _mtp_park_state_for_batch(gen_batch)
     if state.reentry_probe and park_state is not None:
@@ -3289,6 +3740,11 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
         depth_str = ""
     if stats.zero_cycles:
         depth_str += f" d0={stats.zero_cycles}"
+    if stats.copy_cycles:
+        depth_str += (
+            f" copy={stats.copy_accepted}/{stats.copy_drafted}"
+            f" in {stats.copy_cycles}"
+        )
     tpc = total_emits / stats.cycles if stats.cycles else 0.0
     logger.info(
         "MTP[%s] finish=%s tokens=%d cycles=%d tok/cycle=%.2f accept=%d/%d (%s)%s "
@@ -3335,6 +3791,37 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
     if state.chain:
         return _run_verify_cycle_chain(gen_batch, state)
     return _run_verify_cycle_legacy(gen_batch, state)
+
+
+class SparseDraftQ:
+    """Draft log-densities over per-position candidate ids, zero elsewhere.
+
+    ``ids`` and ``logq`` are ``(k, C)``. Indexing yields the dense
+    ``(vocab,)`` log row for consumers that need the full distribution.
+    """
+
+    def __init__(self, ids, logq, vocab: int):
+        self.ids = ids
+        self.logq = logq
+        self.vocab = int(vocab)
+
+    def __len__(self) -> int:
+        return int(self.ids.shape[0])
+
+    def __getitem__(self, index):
+        import mlx.core as mx
+
+        row = mx.full((self.vocab,), -float("inf"), dtype=mx.float32)
+        return mx.put_along_axis(row, self.ids[index], self.logq[index], axis=-1)
+
+    def arrays(self) -> list:
+        return [self.ids, self.logq]
+
+
+def _dense_q_rows(draft_accept_lps) -> list:
+    if isinstance(draft_accept_lps, SparseDraftQ):
+        return [draft_accept_lps[i] for i in range(len(draft_accept_lps))]
+    return list(draft_accept_lps)
 
 
 def _sparse_top_k(sampler) -> int:
@@ -3385,14 +3872,28 @@ def _stochastic_verify_tokens_sparse(
         mx.sum(mx.where(hit, logp[:k], 0.0), axis=-1),
         -float("inf"),
     )
-    q_rows = mx.stack(draft_accept_lps)  # (k, V)
-    q_at = mx.take_along_axis(q_rows, d[:, None], axis=-1).squeeze(-1)
+    if isinstance(draft_accept_lps, SparseDraftQ):
+        q_ids = draft_accept_lps.ids[:k]
+        q_lp = draft_accept_lps.logq[:k]
+        q_hit = q_ids == d[:, None]
+        q_at = mx.where(
+            mx.any(q_hit, axis=-1),
+            mx.sum(mx.where(q_hit, q_lp, 0.0), axis=-1),
+            -float("inf"),
+        )
+    else:
+        q_rows = mx.stack(draft_accept_lps)  # (k, V)
+        q_at = mx.take_along_axis(q_rows, d[:, None], axis=-1).squeeze(-1)
     ratio = p_at - q_at
     u = mx.random.uniform(shape=(k,))
     acc = mx.logical_or(ratio >= 0, mx.log(u) < ratio)
     m_arr = mx.cumprod(acc.astype(mx.int32)).sum().reshape(1)
     p_sup = mx.exp(logp[:k])
-    q_sup = mx.exp(mx.take_along_axis(q_rows, ids[:k], axis=-1).astype(mx.float32))
+    if isinstance(draft_accept_lps, SparseDraftQ):
+        match = ids[:k, :, None] == q_ids[:, None, :]
+        q_sup = mx.sum(mx.where(match, mx.exp(q_lp)[:, None, :], 0.0), axis=-1)
+    else:
+        q_sup = mx.exp(mx.take_along_axis(q_rows, ids[:k], axis=-1).astype(mx.float32))
     res = mx.maximum(p_sup - q_sup, 0.0)
     z = res.sum(axis=-1, keepdims=True)
     res_dist = mx.where(z > 0, res, p_sup)
@@ -3430,7 +3931,7 @@ def _stochastic_verify_tokens(sampler, combined_lp, drafts, draft_accept_lps):
         filtered = sampling_logits(combined_lp)
         density = filtered.astype(mx.float32)
         accept_rows = density - mx.logsumexp(density, axis=-1, keepdims=True)
-    q_rows = mx.stack(draft_accept_lps)  # (k, V)
+    q_rows = mx.stack(_dense_q_rows(draft_accept_lps))  # (k, V)
     idx = drafts.astype(mx.int32)[:, None]
     p_at = mx.take_along_axis(accept_rows[:k], idx, axis=-1).squeeze(-1)
     q_at = mx.take_along_axis(q_rows, idx, axis=-1).squeeze(-1)
@@ -3474,6 +3975,44 @@ def _predraft(gen_batch, state, drafter, captured, host_arr, m_arr, anchor) -> b
     return bool(predraft(gen_batch, state, captured, m_arr + 1, anchor))
 
 
+def _context_copy_drafts(
+    gen_batch: Any, state: _MtpState, committed_ids: List[int]
+) -> List[int]:
+    """Draft the next window by copying from the context, if it repeats.
+
+    Singleton chain cycles. Greedy acceptance is exact token equality against
+    the target's own argmax; sampled acceptance treats the copy as a draft
+    distribution with all its mass on the copied token (``_copy_draft_q``),
+    so the Leviathan/Chen rule keeps the sampled distribution exact. Either
+    way any draft source leaves the output distribution unchanged. Returns
+    ``[]`` when the MTP head should draft instead.
+    """
+    if state.context_copy is None:
+        state.context_copy = _context_copy.ContextCopy(
+            wide_window=_row_exact_verify(gen_batch.model)
+        )
+    copier = state.context_copy
+    state.copy_untimed = copier.extend(gen_batch.tokens[0], committed_ids)
+    # The next cycle emits up to len(drafts) + 1 tokens after the queued ones.
+    room = (
+        gen_batch.max_tokens[0] - gen_batch._num_tokens[0] - len(committed_ids) - 1
+    )
+    if _dspark_host(gen_batch.model) is None:
+        return copier.propose(room)
+    # Copies verify in DSpark's window sizes, and only a copy that fills the
+    # block replaces it: DSpark already drafts repeated text accurately.
+    copied = copier.propose(min(room, state.depth))
+    return copied if len(copied) == state.depth else []
+
+
+def _copy_draft_q(copied: List[int], vocab: int) -> SparseDraftQ:
+    """One-hot draft distributions for a copied window."""
+    import mlx.core as mx
+
+    ids = mx.array(copied, dtype=mx.int32)[:, None]
+    return SparseDraftQ(ids, mx.zeros(ids.shape, dtype=mx.float32), vocab)
+
+
 def _run_verify_cycle_chain(
     gen_batch: Any,
     state: _MtpState,
@@ -3508,6 +4047,7 @@ def _run_verify_cycle_chain(
     # Adaptive depth: the chain may have drafted fewer than state.depth
     # tokens this cycle — the verify window follows the actual drafts.
     k = int(state.drafts.shape[0])
+    copy_cycle = state.copy_drafts
     cycle_t0 = time.perf_counter()
 
     inputs = mx.concatenate([state.next_main, state.drafts])  # (k+1,)
@@ -3578,7 +4118,7 @@ def _run_verify_cycle_chain(
         state.stats.zero_cycles += 1
     elif is_greedy:
         if greedy_result is None:
-            targets = mx.argmax(rows, axis=-1).astype(mx.int32)  # (k+1,)
+            targets = _greedy_targets(combined_lp)  # (k+1,)
             matches = (targets[:k] == state.drafts.astype(mx.int32)).astype(mx.int32)
             m_arr = mx.cumprod(matches).sum().reshape(1)
             host_arr = mx.concatenate([m_arr, targets, state.drafts.astype(mx.int32)])
@@ -3699,61 +4239,44 @@ def _run_verify_cycle_chain(
 
     # --- stats ---
     state.stats.cycles += 1
-    if len(state.stats.depth_drafted) < state.depth:
-        pad = state.depth - len(state.stats.depth_drafted)
-        state.stats.depth_drafted.extend([0] * pad)
-        state.stats.depth_accepted.extend([0] * pad)
-    for j in range(k):
-        state.stats.depth_drafted[j] += 1
-        if j < m:
-            state.stats.depth_accepted[j] += 1
-        else:
-            break
-    state.stats.accepts += m
+    if copy_cycle:
+        state.stats.copy_cycles += 1
+        state.stats.copy_drafted += k
+        state.stats.copy_accepted += m
+        state.context_copy.observe(m, k)
+    else:
+        # A batch policy can lower state.depth below the drafts a row holds.
+        depth = max(state.depth, k)
+        if len(state.stats.depth_drafted) < depth:
+            pad = depth - len(state.stats.depth_drafted)
+            state.stats.depth_drafted.extend([0] * pad)
+            state.stats.depth_accepted.extend([0] * pad)
+        for j in range(k):
+            state.stats.depth_drafted[j] += 1
+            if j < m:
+                state.stats.depth_accepted[j] += 1
+            else:
+                break
+        state.stats.accepts += m
     if m < k:
         state.stats.rejects += 1
     state.stats.sample_ms += (time.perf_counter() - t0) * 1000
 
     accept_ms = (time.perf_counter() - cycle_t0) * 1000
 
-    def finish(shared_commit_ms=0.0):
-        finish_t0 = time.perf_counter()
-        # --- commit: queue emits + cache rollback ---
-        t0 = time.perf_counter()
-        for j in range(m):
-            # Block drafters carry no draft distribution; the target row is
-            # the distribution the accepted token was verified against.
-            draft_lp = state.draft_lps[j] if state.draft_lps else combined_lp[j]
-            state.queue.append((int(draft_ids[j]), draft_lp, "draft"))
-        state.queue.append(
-            (int(emit_last_id), emit_last_lp, "bonus" if m == k else "verify")
-        )
-        if commit_cache is not None:
-            gen_batch.prompt_cache = commit_cache(m)
-        elif m == k and gdn_states is None:
-            _clear_rollback(gen_batch.prompt_cache)
-        elif not _chain_rollback(
-            gen_batch.model, gen_batch.prompt_cache, m, k, gdn_states
-        ):
-            if procs is not None:
-                _trim_token_buffer(gen_batch, k - m)
-            raise _MtpStepFallback("cache layer rejects chain rollback")
-        if m < k and procs is not None:
-            _trim_token_buffer(gen_batch, k - m)
-        state.stats.cache_ops_ms += (time.perf_counter() - t0) * 1000 + shared_commit_ms
-
+    def draft_next():
         # --- MTP-head history + next draft chain (async-dispatched) ---
         t0 = time.perf_counter()
         if draft_jobs is None and not state.head_clone:
             _mtp_head_trim_to(state.mtp_cache, state.hist_offset)
-        committed = mx.array(
-            [int(d) for d in draft_ids[:m]] + [int(emit_last_id)], dtype=mx.uint32
-        )
+        committed_ids = [int(d) for d in draft_ids[:m]] + [int(emit_last_id)]
+        committed = mx.array(committed_ids, dtype=mx.uint32)
         next_main = committed[-1:]
         hidden_rows = hidden[:, : m + 1]
         prev_buf = None
         if procs is not None:
             prev_buf = gen_batch._token_context[0].tokens
+        state.copy_drafts = False
         if drafter is not None and predrafted and m == m_gpu:
             drafter.adopt_predraft(state, m + 1)
         elif drafter is not None:
@@ -3766,15 +4289,70 @@ def _run_verify_cycle_chain(
             else:
                 draft_jobs.append(job)
         elif draft_jobs is None:
-            _chain_next_drafts(gen_batch, state, hidden_rows, committed, prev_buf)
+            copied = _context_copy_drafts(gen_batch, state, committed_ids)
+            _chain_next_drafts(
+                gen_batch,
+                state,
+                hidden_rows,
+                committed,
+                prev_buf,
+                depth=0 if copied else None,
+            )
+            if copied:
+                state.drafts = mx.array(copied, dtype=mx.uint32)
+                state.draft_lps = []
+                # A copy is a deterministic proposer: q puts all its mass on
+                # the copied token, so acceptance is p(token) and the
+                # residual on rejection is p without it.
+                state.draft_accept_lps = (
+                    [] if is_greedy else _copy_draft_q(copied, combined_lp.shape[-1])
+                )
+                state.copy_drafts = True
         else:
             draft_jobs.append((gen_batch, state, hidden_rows, committed, prev_buf))
         state.next_main = next_main
         state.stats.mtp_head_ms += (time.perf_counter() - t0) * 1000
+
+    def finish(shared_commit_ms=0.0):
+        finish_t0 = time.perf_counter()
+        # --- commit: queue emits + cache rollback ---
+        for j in range(m):
+            # Block drafters carry no draft distribution; the target row is
+            # the distribution the accepted token was verified against.
+            draft_lp = state.draft_lps[j] if state.draft_lps else combined_lp[j]
+            state.queue.append((int(draft_ids[j]), draft_lp, "draft"))
+        state.queue.append(
+            (int(emit_last_id), emit_last_lp, "bonus" if m == k else "verify")
+        )
+        if m < k and procs is not None:
+            _trim_token_buffer(gen_batch, k - m)
+        # The GPU runs a chain that never reads the backbone cache while the
+        # host rolls that cache back.
+        draft_first = (
+            drafter is None
+            and draft_jobs is None
+            and commit_cache is None
+            and _drafts_before_commit(gen_batch.model)
+        )
+        if draft_first:
+            draft_next()
+        t0 = time.perf_counter()
+        if commit_cache is not None:
+            gen_batch.prompt_cache = commit_cache(m)
+        elif m == k and gdn_states is None:
+            _clear_rollback(gen_batch.prompt_cache)
+        elif not _chain_rollback(
+            gen_batch.model, gen_batch.prompt_cache, m, k, gdn_states
+        ):
+            raise _MtpStepFallback("cache layer rejects chain rollback")
+        state.stats.cache_ops_ms += (time.perf_counter() - t0) * 1000 + shared_commit_ms
+        if not draft_first:
+            draft_next()
         if materialize_boundary_emit:
             _materialize_mtp_boundary_emit(gen_batch, state)
             state.boundary_emit_pending = False
-        if state.controller is not None:
+        untimed, state.copy_untimed = state.copy_untimed, False
+        if state.controller is not None and not copy_cycle:
             was_warmup = bool(state.controller._warmup)
             keepalive = bool(getattr(state.mtp_cache, "fold_keepalive", False))
             if keepalive:
@@ -3786,7 +4364,7 @@ def _run_verify_cycle_chain(
                 + (time.perf_counter() - finish_t0) * 1000
                 + verify_ms
                 + shared_commit_ms,
-                time_sample=not keepalive,
+                time_sample=not keepalive and not untimed,
             )
             _maybe_finish_mtp_reentry_probe(
                 gen_batch,
@@ -3837,6 +4415,8 @@ def _materialize_mtp_boundary_emit(gen_batch: Any, state: _MtpState) -> None:
     mx.eval(next_tok)
     state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
 
+    # The drafts below replace any copied window.
+    state.copy_drafts = False
     t0 = time.perf_counter()
     if drafter is not None:
         drafter.draft([(gen_batch, state, captured, next_tok, prev_buf)])

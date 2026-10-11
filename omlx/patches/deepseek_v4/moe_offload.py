@@ -32,7 +32,6 @@ unavailable.
 from __future__ import annotations
 
 import logging
-import os
 from concurrent.futures import wait
 from pathlib import Path
 
@@ -48,6 +47,7 @@ from ..moe_expert_offload import (
     _GLUStoreView,
     _io_batch,
     _io_pool,
+    _is_mtp_path,
     _minimum_experts,
     _resolve_model_dir,
 )
@@ -313,15 +313,6 @@ def _iter_deepseek_v4_switch_glus(model):
     yield from walk(None, None, model, "")
 
 
-def _is_mtp_path(path: str) -> bool:
-    """Tree path of a module inside the embedded MTP draft head.
-
-    Matches the VLM-nested ``language_model.mtp.<i>.*`` and the text-root
-    ``mtp.<i>.*`` layouts, mirroring ``glm5_next_vlm_runtime._is_mtp_named``.
-    """
-    return path == "mtp" or path.startswith("mtp.") or ".mtp." in path
-
-
 def apply_deepseek_v4_moe_expert_offload(
     model,
     model_path: str | Path,
@@ -332,8 +323,8 @@ def apply_deepseek_v4_moe_expert_offload(
     """Wrap every covered DeepSeek V4 SwitchGLU; returns the number wrapped.
 
     Same contract as ``apply_moe_expert_offload``: runs before lazy weights
-    materialize, honors the kill switch, and skips (with a logged reason)
-    any module the checkpoint does not cover.
+    materialize and skips (with a logged reason) any module the checkpoint
+    does not cover.
 
     ``mtp_resident`` keeps the embedded MTP draft head's experts fully
     resident (glm5_next Lightning MTP + offload): the head is one decoder
@@ -341,8 +332,6 @@ def apply_deepseek_v4_moe_expert_offload(
     experts would add SSD latency to every draft step. With the flag off,
     the head wraps like any other layer, exactly as before.
     """
-    if os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") == "0":
-        return 0
     targets = list(_iter_deepseek_v4_switch_glus(model))
     if not targets:
         return 0
